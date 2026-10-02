@@ -18,7 +18,6 @@ appended to the end of ALICE to reveal the original instruction.
 
 Requirements:
     python
-    bitstring for python https://github.com/scott-griffiths/bitstring
 
 Copyright 2018 Donn Morrison donn.morrison@gmail.com
 
@@ -44,7 +43,26 @@ import os
 import sys
 import struct
 import getopt
-from bitstring import BitArray
+
+class BitBuf:
+    """Bit view over bytes: MSB first inside each byte, same order as the
+    BitArray slicing this replaces. len() is the number of bits."""
+
+    def __init__(self, data):
+        self.d = bytes(data)
+
+    def __len__(self):
+        return len(self.d) * 8
+
+    def peek(self, pos, n):
+        first = pos >> 3
+        need = (pos & 7) + n
+        chunk = self.d[first:first + (need + 7) // 8]
+        if len(chunk) * 8 < need:
+            chunk += b'\0' * ((need + 7) // 8 - len(chunk))
+        v = int.from_bytes(chunk, 'big')
+        return (v >> (len(chunk) * 8 - (pos & 7) - n)) & ((1 << n) - 1)
+
 
 def bitunpack():
     global fout, instrdict, range_regs, bitbuff, mappings, alicebin, blocksize
@@ -66,6 +84,7 @@ def bitunpack():
     prefixes = [start << r for start,r in zip(starts, range_regs)]
     lengths = [r + 3 for r in range_regs]
     range_regs_pow = [0] + [int(math.pow(2, r)) for r in range_regs[0:-1]]
+    lows = [sum(range_regs_pow[0:i+1]) for i in range(8)]
 
     while bitptr < ((mappings[-1])[0] + mappings[-1][1])*8 and bitptr < len(bitbuff): # mapping table addr + len
         # Check if we've done a block
@@ -109,34 +128,32 @@ def bitunpack():
 #        print("next 64 bits: %s"%(format(bitbuff[bitptr:bitptr+64].uint, '#066b')))
 #        print("contains %d ones"%(bin(bitbuff[bitptr:bitptr+64].uint)[2:].count('1')))
 
-        # Look for instruction header
-        for s,l in zip(starts,lengths):
-            if bitbuff[bitptr:bitptr+3].uint == s:
-                # Fetch the range encoded instruction
-                instr = bitbuff[bitptr:bitptr+l].uint
+        # The 3 bit prefix is the range index, so look the length up directly
+        # instead of testing all eight candidates.
+        s = bitbuff.peek(bitptr, 3)
+        l = lengths[s]
+        # Fetch the range encoded instruction
+        instr = bitbuff.peek(bitptr, l)
 #                print("%d (0x%x,%d): fetched instruction 0x%08x and prefix 0x%x, length %d"%(bitptr, int(bitptr/8), bitptr%8, instr, prefixes[starts.index(s)], l))
 
-                # If encoded, look up in dictionary
-                if s != 0x7:
-                    # Find the range (have to sum previous ranges to get correct index)
-                    low = sum(range_regs_pow[0:starts.index(s)+1])
-                    # Subtract the instruction prefix
-                    instridx = instr - prefixes[starts.index(s)]
-                    # This is the index into the range_reg subrange
-                    originstr = instrdict[low + instridx]
-                else:
-                    # Not encoded, simply extract the instruction
-                    originstr = instr & 0xffff
+        # If encoded, look up in dictionary
+        if s != 0x7:
+            # Range base, precomputed rather than summed per instruction
+            low = lows[s]
+            # Subtract the instruction prefix
+            instridx = instr - prefixes[s]
+            # This is the index into the range_reg subrange
+            originstr = instrdict[low + instridx]
+        else:
+            # Not encoded, simply extract the instruction
+            originstr = instr & 0xffff
 #                print("original instruction 0x%04x written at 0x%08x"%(originstr,byteswritten))
-                lastinstr = originstr
-                decomp = struct.pack("<H", originstr)
-                # Write decoded instruction to buffer/file
-                fout.write(decomp)
-                byteswritten += len(decomp)
-                alicebin += bytearray(decomp)
-                # Advance pointer
-                bitptr += l
-                break
+        lastinstr = originstr
+        # Collect output, written out once at the end
+        alicebin += struct.pack("<H", originstr)
+        byteswritten += 2
+        # Advance pointer
+        bitptr += l
     print("--- stream exhausted at block %d of %d"%(numblocks, total_blocks))
     return
 
@@ -300,7 +317,7 @@ print("--- last %s"%(instrdict[-1]))
 
 f.close()
 
-bitbuff = BitArray(buff)
+bitbuff = BitBuf(buff)
 
 print("loaded compressed alice %d bytes"%(len(bitbuff)/8))
 
@@ -313,6 +330,7 @@ print("unpacking alice...")
 #try:
 bitunpack()
 print("done")
+fout.write(alicebin)
 
 print("block checkpoints: %d matched, %d mismatched"%(
     int(total_blocks/2) - len(mismatched), len(mismatched)))
