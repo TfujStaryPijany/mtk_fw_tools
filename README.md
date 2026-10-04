@@ -24,15 +24,25 @@ Briefly, the encoder performs the following steps:
 4. Generate dictionary (histogram)
 5. Range encode instructions
 6. Bitpack range encoded instructions
-7. Generate mapping table (24-bit pointers to individual blocks), low byte unknown
+7. Generate mapping table (one 32-bit entry per even block: bits 0..23 are
+   the block address, bits 24..31 are `((block length in bytes) - 13) << 2`)
 8. Postprocess, prepend header, append mapping table and dictionary, etc
 
 The decoder must do the reverse. In short, we read the compressed data as a bit string, looking up each instruction in the dictionary to retrieve the uncompressed version as we proceed. The mapping table tells us when we have reached a block of $blocksize (typically 64 bytes, 32 instructions), at which point we skip to the next start-of-byte and proceed. Presumably this lets the firmware decode segments of the code as needed, without loading the entire image into memory.
 
 # Tools
 
-+ alice.py - pack ALICE partition (not working 100% yet, use ALICE.exe instead)
-+ unalice.py - unpack ALICE partition (working for ALICE_1, ALICE_2 partition types except for some minor issues)
++ alice.py - partial prototype of a from scratch packer. It bitpacks the
+  instruction stream but does not generate the mapping table, the dictionary
+  or the header, so its output is not a loadable ALICE image. Use
+  `alice_pack.py` for repacking, or ALICE.exe.
++ alice_pack.py - repack a decoded stream into a valid ALICE_2 image, reusing
+  the dictionary and range registers of a reference image. Verified by a byte
+  exact round trip.
++ unalice.py - unpack ALICE partition (ALICE_1 and ALICE_2). The end of stream
+  is derived from the mapping table rather than guessed, every even block is
+  checked against its mapping entry while decoding, and there is no longer a
+  dependency on `bitstring`.
 
 # Usage
 
@@ -71,3 +81,31 @@ $ python3 unalice.py ALICE
 Load the resulting `alice-py.bin` into your favourite disassembler!
 
 If BL/BLX targets seem to not make sense in the disassembler, try using the `-t` option with `unalice.py`.
+
+### Repacking
+
+`alice_pack.py` encodes a decoded stream back into an ALICE_2 image. It takes
+the dictionary, the range registers and the block size from a reference image,
+so the two unsolved parts of from scratch packing, the dictionary histogram
+ordering and dynamic range registers, do not come into play. Prefix 7 is a 19
+bit literal escape, so instructions missing from the dictionary still encode.
+
+```
+$ python3 unalice.py -t ALICE out.bin      # decode
+$ ...                                      # patch out.bin
+$ python3 alice_pack.py out.bin ALICE ALICE.new
+```
+
+Use the same `-t` setting for decoding and patching: without `-t` the decoder
+rewrites BL/BLX targets, and the packer expects the stream in its stored form.
+
+On an `ALICE_2` image of 2014800 bytes, 19537 mapping entries, 39074 blocks of
+32 instructions, decoding and then repacking with no changes reproduces the
+input byte for byte. Patching a string and an instruction that is absent from
+the dictionary, so that it takes the literal escape, also survives a round
+trip, with the mapping table addresses shifting as expected.
+
+Two details that matter for a valid image: the compressed region is padded so
+that the mapping table starts on a 4 byte boundary, since its entries are 32
+bit words, and the block address is a 24 bit field, so it has to be masked
+before being combined with the flag byte.
